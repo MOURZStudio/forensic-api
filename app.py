@@ -86,9 +86,9 @@ def run_metadata(file_bytes, img):
         has_exif = False
     fields.append({"key": "EXIF metadata", "value": "Ditemukan" if has_exif else "Tidak ada (indikasi AI/transfer)", "ok": has_exif})
     if not has_exif:
-        susp += 1
+        susp += 3
 
-    score = min(1.0, susp * 0.22)
+    score = min(1.0, susp * 0.20)
     score = round(score, 3)
 
     return {
@@ -207,7 +207,7 @@ def run_noise(img):
 
 # ── WEIGHTED SCORING ─────────────────────────────────────────────────────────
 def compute_weighted(ela, meta, clone, noise):
-    weights = {"ela": 0.30, "noise": 0.30, "clone": 0.25, "meta": 0.15}
+    weights = {"ela": 0.30, "noise": 0.30, "clone": 0.15, "meta": 0.25}
     ws = (ela["score"]   * weights["ela"] +
           noise["score"] * weights["noise"] +
           clone["score"] * weights["clone"] +
