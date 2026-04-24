@@ -21,28 +21,21 @@ def img_to_base64(img, fmt="PNG"):
     return base64.b64encode(buf.getvalue()).decode()
 
 # ── 1. ELA ───────────────────────────────────────────────────────────────────
-# Double-save method: simpan JPEG → buka → simpan lagi → bandingkan
-# Ini cara ELA yang benar untuk mendeteksi inkonsistensi kompresi
+# Pendekatan consistency-based:
+# Foto asli dari kamera: error level KONSISTEN di seluruh area (std rendah)
+# Foto manipulasi: ada area dengan error BERBEDA dari sekitarnya (std tinggi)
+# Menggunakan Coefficient of Variation (CV = std/mean) sebagai indikator utama
+# Parameter kualitas 90 mengikuti Bisri & Marzuki (2023)
 def run_ela(file_bytes, img_resized, quality=90, amplify=15):
     try:
         orig = Image.open(io.BytesIO(file_bytes)).convert("RGB")
         orig.thumbnail(MAX_SIZE, Image.LANCZOS)
-
-        # Save pertama — ini mensimulasikan "state sebelum edit"
-        buf1 = io.BytesIO()
-        orig.save(buf1, format="JPEG", quality=quality)
-        buf1.seek(0)
-        first_save = Image.open(buf1).convert("RGB")
-
-        # Save kedua — area yang dimanipulasi akan punya error berbeda
-        buf2 = io.BytesIO()
-        first_save.save(buf2, format="JPEG", quality=quality)
-        buf2.seek(0)
-        second_save = Image.open(buf2).convert("RGB")
-
-        ela_img = ImageChops.difference(first_save, second_save)
+        buf = io.BytesIO()
+        orig.save(buf, format="JPEG", quality=quality)
+        buf.seek(0)
+        recompressed = Image.open(buf).convert("RGB")
+        ela_img = ImageChops.difference(orig, recompressed)
         arr = np.array(ela_img, dtype=np.float32)
-
     except Exception:
         buf = io.BytesIO()
         img_resized.save(buf, format="JPEG", quality=quality)
@@ -51,19 +44,39 @@ def run_ela(file_bytes, img_resized, quality=90, amplify=15):
         ela_img = ImageChops.difference(img_resized, recompressed)
         arr = np.array(ela_img, dtype=np.float32)
 
-    avg_err = float(np.mean(arr))
+    # Error map per piksel (rata-rata 3 channel)
+    err_map = np.mean(arr, axis=2)  # shape: (H, W)
+
+    avg_err = float(np.mean(err_map))
     max_err = float(np.max(arr))
+    std_err = float(np.std(err_map))
 
-    # Threshold 10 lebih sensitif untuk menangkap inkonsistensi halus
-    susp_pixels = int(np.sum(arr > 10))
-    total_pixels = arr.shape[0] * arr.shape[1]
-    susp_ratio = round(susp_pixels / total_pixels * 100, 2)
+    # Coefficient of Variation: mengukur inkonsistensi error
+    # Foto asli: CV rendah (~0.3-0.6) | Foto manipulasi: CV tinggi (>0.8)
+    cv = std_err / (avg_err + 1e-6)
 
-    amplified = np.clip(arr * amplify, 0, 255).astype(np.uint8)
-    ela_visual = Image.fromarray(amplified)
+    # Outlier pixels: piksel yang error-nya jauh di atas rata-rata
+    # Threshold adaptif: mean + 2*std (outlier statistik)
+    threshold_adaptive = avg_err + 2 * std_err
+    outlier_pixels = int(np.sum(err_map > threshold_adaptive))
+    outlier_ratio = round(outlier_pixels / err_map.size * 100, 2)
 
-    # Normalisasi: avg_err dibagi 5 agar lebih responsif pada manipulasi
-    score = min(1.0, (avg_err / 5.0) * 0.5 + (susp_ratio / 100) * 0.5)
+    # Suspicious area dengan threshold Bisri & Marzuki (2023): sensitivitas 20
+    susp_pixels = int(np.sum(err_map > 20))
+    susp_ratio = round(susp_pixels / err_map.size * 100, 2)
+
+    # Visualisasi: RGB berwarna agar lebih informatif
+    ela_rgb = np.zeros((*arr.shape[:2], 3), dtype=np.uint8)
+    ela_rgb[:, :, 0] = np.clip(arr[:, :, 0] * amplify, 0, 255)
+    ela_rgb[:, :, 1] = np.clip(arr[:, :, 1] * amplify, 0, 255)
+    ela_rgb[:, :, 2] = np.clip(arr[:, :, 2] * amplify, 0, 255)
+    ela_visual = Image.fromarray(ela_rgb)
+
+    # Scoring: kombinasi CV (inkonsistensi) dan outlier ratio
+    # CV > 1.5 sangat mencurigakan | outlier > 15% sangat mencurigakan
+    cv_score = min(1.0, cv / 1.5)
+    outlier_score = min(1.0, outlier_ratio / 15.0)
+    score = min(1.0, cv_score * 0.5 + outlier_score * 0.5)
     score = round(score, 3)
 
     return {
@@ -71,6 +84,8 @@ def run_ela(file_bytes, img_resized, quality=90, amplify=15):
         "avg_error": round(avg_err, 2),
         "max_error": round(max_err, 2),
         "suspicious_area_pct": susp_ratio,
+        "outlier_ratio": outlier_ratio,
+        "consistency_cv": round(cv, 3),
         "status": "Mencurigakan" if score >= 0.45 else "Normal",
         "ela_image": img_to_base64(ela_visual)
     }
