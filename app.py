@@ -169,45 +169,90 @@ def run_metadata(file_bytes, img):
         "warning": warning
     }
 
-# ── 3. CLONE DETECTION ────────────────────────────────────────────────────────
+# ── 3. CLONE DETECTION (ORB + Offset Consistency) ────────────────────────────
+# Menggunakan ORB (Oriented FAST and Rotated BRIEF) dari OpenCV
+# Pendekatan: deteksi keypoints unik lalu cari pasangan yang lokasinya jauh
+# tapi descriptor-nya sangat mirip (Hamming distance rendah)
+# Offset consistency: copy-move menghasilkan banyak match dengan OFFSET YANG SAMA
 def run_clone(img):
-    gray = np.array(img.convert("L"), dtype=np.float32)
-    H, W = gray.shape
-    bsize = 16
-    blocks = []
-    for y in range(0, H - bsize, bsize):
-        for x in range(0, W - bsize, bsize):
-            patch = gray[y:y+bsize, x:x+bsize]
-            blocks.append({"x": x, "y": y, "mean": float(np.mean(patch)), "std": float(np.std(patch))})
-    matches = []
-    n = len(blocks)
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist_px = ((blocks[i]["x"]-blocks[j]["x"])**2 + (blocks[i]["y"]-blocks[j]["y"])**2) ** 0.5
-            if dist_px < bsize * 2:
+    import cv2
+    from collections import Counter
+
+    gray = np.array(img.convert("L"))
+
+    # ORB detector
+    orb = cv2.ORB_create(nfeatures=2000)
+    keypoints, descriptors = orb.detectAndCompute(gray, None)
+
+    if descriptors is None or len(keypoints) < 10:
+        vis = img.copy()
+        return {
+            "score": 0.0,
+            "feature_points": len(keypoints) if keypoints else 0,
+            "suspicious_clusters": 0,
+            "status": "Tidak ada duplikasi signifikan",
+            "clone_image": img_to_base64(vis)
+        }
+
+    # BFMatcher dengan Hamming distance
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    matches = bf.knnMatch(descriptors, descriptors, k=4)
+
+    # Filter: bukan self-match, Hamming < 30, jarak spatial > 40px
+    good = []
+    for mg in matches:
+        for m in mg:
+            if m.queryIdx == m.trainIdx:
                 continue
-            if abs(blocks[i]["mean"]-blocks[j]["mean"]) < 5 and abs(blocks[i]["std"]-blocks[j]["std"]) < 5:
-                matches.append((blocks[i], blocks[j]))
-            if len(matches) >= 25:
-                break
-        if len(matches) >= 25:
-            break
+            if m.distance > 30:
+                continue
+            kp1 = keypoints[m.queryIdx]
+            kp2 = keypoints[m.trainIdx]
+            spatial = np.sqrt((kp1.pt[0]-kp2.pt[0])**2 + (kp1.pt[1]-kp2.pt[1])**2)
+            if spatial > 40:
+                good.append((kp1, kp2))
+
+    # Offset consistency: copy-move punya offset yang konsisten
+    # Background berulang: offset banyak variasi, tidak dominan
+    if not good:
+        max_consistent = 0
+        score = 0.0
+    else:
+        offsets = [
+            (int((b.pt[0]-a.pt[0])/15)*15, int((b.pt[1]-a.pt[1])/15)*15)
+            for a, b in good
+        ]
+        counts = Counter(offsets)
+        max_consistent = max(counts.values())
+        ratio = max_consistent / max(len(good), 1)
+
+        if max_consistent >= 5 and ratio > 0.4:
+            score = min(1.0, (max_consistent/10) * 0.5 + ratio * 0.5)
+        elif max_consistent >= 3 and ratio > 0.6:
+            score = min(1.0, ratio * 0.8)
+        else:
+            score = min(0.3, max_consistent / 20)
+
+    score = round(score, 3)
+
+    # Visualisasi: gambar garis antara pasangan yang mencurigakan
     vis = img.copy()
     try:
         from PIL import ImageDraw
         draw = ImageDraw.Draw(vis)
-        for a, b in matches[:12]:
-            draw.rectangle([a["x"], a["y"], a["x"]+bsize, a["y"]+bsize], outline="#D85A30", width=2)
-            draw.rectangle([b["x"], b["y"], b["x"]+bsize, b["y"]+bsize], outline="#D85A30", width=2)
-            draw.line([(a["x"]+bsize//2, a["y"]+bsize//2), (b["x"]+bsize//2, b["y"]+bsize//2)], fill="#D85A30", width=1)
+        for kp1, kp2 in good[:15]:
+            x1, y1 = int(kp1.pt[0]), int(kp1.pt[1])
+            x2, y2 = int(kp2.pt[0]), int(kp2.pt[1])
+            draw.ellipse([x1-4, y1-4, x1+4, y1+4], outline="#D85A30", width=2)
+            draw.ellipse([x2-4, y2-4, x2+4, y2+4], outline="#D85A30", width=2)
+            draw.line([x1, y1, x2, y2], fill="#D85A30", width=1)
     except Exception:
         pass
-    score = min(1.0, len(matches) / 12 * 0.7 + (0.3 if len(matches) > 6 else 0))
-    score = round(score, 3)
+
     return {
         "score": score,
-        "feature_points": len(blocks),
-        "suspicious_clusters": len(matches),
+        "feature_points": len(keypoints),
+        "suspicious_clusters": max_consistent,
         "status": "Ada duplikasi terdeteksi" if score >= 0.45 else "Tidak ada duplikasi signifikan",
         "clone_image": img_to_base64(vis)
     }
