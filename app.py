@@ -21,22 +21,51 @@ def img_to_base64(img, fmt="PNG"):
     return base64.b64encode(buf.getvalue()).decode()
 
 # ── 1. ELA ───────────────────────────────────────────────────────────────────
-def run_ela(img, quality=90, amplify=12):
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
-    buf.seek(0)
-    recompressed = Image.open(buf).convert("RGB")
-    ela_img = ImageChops.difference(img, recompressed)
-    arr = np.array(ela_img, dtype=np.float32)
+# Double-save method: simpan JPEG → buka → simpan lagi → bandingkan
+# Ini cara ELA yang benar untuk mendeteksi inkonsistensi kompresi
+def run_ela(file_bytes, img_resized, quality=90, amplify=15):
+    try:
+        orig = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        orig.thumbnail(MAX_SIZE, Image.LANCZOS)
+
+        # Save pertama — ini mensimulasikan "state sebelum edit"
+        buf1 = io.BytesIO()
+        orig.save(buf1, format="JPEG", quality=quality)
+        buf1.seek(0)
+        first_save = Image.open(buf1).convert("RGB")
+
+        # Save kedua — area yang dimanipulasi akan punya error berbeda
+        buf2 = io.BytesIO()
+        first_save.save(buf2, format="JPEG", quality=quality)
+        buf2.seek(0)
+        second_save = Image.open(buf2).convert("RGB")
+
+        ela_img = ImageChops.difference(first_save, second_save)
+        arr = np.array(ela_img, dtype=np.float32)
+
+    except Exception:
+        buf = io.BytesIO()
+        img_resized.save(buf, format="JPEG", quality=quality)
+        buf.seek(0)
+        recompressed = Image.open(buf).convert("RGB")
+        ela_img = ImageChops.difference(img_resized, recompressed)
+        arr = np.array(ela_img, dtype=np.float32)
+
     avg_err = float(np.mean(arr))
     max_err = float(np.max(arr))
-    susp_pixels = int(np.sum(arr > 20))
+
+    # Threshold 10 lebih sensitif untuk menangkap inkonsistensi halus
+    susp_pixels = int(np.sum(arr > 10))
     total_pixels = arr.shape[0] * arr.shape[1]
     susp_ratio = round(susp_pixels / total_pixels * 100, 2)
+
     amplified = np.clip(arr * amplify, 0, 255).astype(np.uint8)
     ela_visual = Image.fromarray(amplified)
-    score = min(1.0, (avg_err / 15) * 0.5 + (susp_ratio / 100) * 0.5)
+
+    # Normalisasi: avg_err dibagi 5 agar lebih responsif pada manipulasi
+    score = min(1.0, (avg_err / 5.0) * 0.5 + (susp_ratio / 100) * 0.5)
     score = round(score, 3)
+
     return {
         "score": score,
         "avg_error": round(avg_err, 2),
@@ -53,7 +82,6 @@ def run_metadata(file_bytes, img):
     susp = 0
     no_exif_flag = False
 
-    # Cek format file
     is_jpeg = file_bytes[:3] == b'\xff\xd8\xff'
     fields.append({
         "key": "Format file",
@@ -63,7 +91,6 @@ def run_metadata(file_bytes, img):
     if not is_jpeg:
         susp += 1
 
-    # GATE UTAMA: cek EXIF kamera
     try:
         img_check = Image.open(io.BytesIO(file_bytes))
         exif_raw = img_check._getexif()
@@ -93,7 +120,6 @@ def run_metadata(file_bytes, img):
         fields.append({"key": "Timestamp", "value": "Tidak ada", "ok": False})
         susp += 4
 
-    # Indikator pendukung
     ratio = round(w / h, 3)
     std_ratios = [4/3, 3/2, 16/9, 1.0, 9/16, 3/4, 2/3]
     is_std = any(abs(ratio - r) < 0.06 for r in std_ratios)
@@ -172,6 +198,8 @@ def run_clone(img):
     }
 
 # ── 4. LOCAL NOISE VARIANCE ───────────────────────────────────────────────────
+# Threshold 1.5 std lebih sensitif dari 2.2
+# Pembagi 20 lebih responsif dari 35
 def run_noise(img):
     gray = np.array(img.convert("L"), dtype=np.float32)
     H, W = gray.shape
@@ -185,18 +213,25 @@ def run_noise(img):
     variances = np.array(variances)
     mean_v = float(np.mean(variances))
     std_v  = float(np.std(variances))
-    anomaly_mask = variances > (mean_v + std_v * 2.2)
+
+    anomaly_mask = variances > (mean_v + std_v * 1.5)
     anomaly_count = int(np.sum(anomaly_mask))
     anomaly_ratio = round(anomaly_count / len(variances) * 100, 2)
+
     noise_arr = np.zeros((H, W, 3), dtype=np.uint8)
     overlay_arr = np.array(img, dtype=np.uint8).copy()
     for idx, (x, y) in enumerate(coords):
         norm = int(min(255, variances[idx] / (mean_v + 1) * 128))
         noise_arr[y:y+bsize, x:x+bsize] = [norm, int(norm*0.4), 255-norm]
         if anomaly_mask[idx]:
-            overlay_arr[y:y+bsize, x:x+bsize] = (overlay_arr[y:y+bsize, x:x+bsize] * 0.5 + np.array([216, 90, 48]) * 0.5).astype(np.uint8)
-    score = min(1.0, anomaly_ratio / 35)
+            overlay_arr[y:y+bsize, x:x+bsize] = (
+                overlay_arr[y:y+bsize, x:x+bsize] * 0.5 +
+                np.array([216, 90, 48]) * 0.5
+            ).astype(np.uint8)
+
+    score = min(1.0, anomaly_ratio / 20)
     score = round(score, 3)
+
     return {
         "score": score,
         "mean_variance": round(mean_v, 2),
@@ -214,13 +249,11 @@ def compute_weighted(ela, meta, clone, noise):
     ws = (ela["score"] * weights["ela"] + noise["score"] * weights["noise"] +
           clone["score"] * weights["clone"] + meta["score"] * weights["meta"])
 
-    # Bonus hybrid: jika 2+ metode positif, tambah 0.10
     methods_positive = sum([ela["score"] >= 0.45, noise["score"] >= 0.45,
                             clone["score"] >= 0.45, meta["score"] >= 0.45])
     if methods_positive >= 2:
         ws = min(1.0, ws + 0.10)
 
-    # Bonus tambahan: jika tidak ada EXIF, ini konteks e-KYC — naik lagi
     if meta.get("no_exif", False):
         ws = min(1.0, ws + 0.08)
 
@@ -267,7 +300,7 @@ def analyze():
     except Exception as e:
         return jsonify({"error": f"Gagal membaca gambar: {str(e)}"}), 400
 
-    ela_result   = run_ela(img)
+    ela_result   = run_ela(file_bytes, img)
     meta_result  = run_metadata(file_bytes, img)
     clone_result = run_clone(img)
     noise_result = run_noise(img)
