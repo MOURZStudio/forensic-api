@@ -198,13 +198,13 @@ def run_clone(img):
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
     matches = bf.knnMatch(descriptors, descriptors, k=4)
 
-    # Filter: bukan self-match, Hamming < 30, jarak spatial > 40px
+    # Filter: bukan self-match, Hamming < 40, jarak spatial > 40px
     good = []
     for mg in matches:
         for m in mg:
             if m.queryIdx == m.trainIdx:
                 continue
-            if m.distance > 30:
+            if m.distance > 40:
                 continue
             kp1 = keypoints[m.queryIdx]
             kp2 = keypoints[m.trainIdx]
@@ -226,12 +226,22 @@ def run_clone(img):
         max_consistent = max(counts.values())
         ratio = max_consistent / max(len(good), 1)
 
-        if max_consistent >= 5 and ratio > 0.4:
-            score = min(1.0, (max_consistent/10) * 0.5 + ratio * 0.5)
-        elif max_consistent >= 3 and ratio > 0.6:
-            score = min(1.0, ratio * 0.8)
+        # Filter background berulang:
+        # Copy-move = 1-2 offset yang sangat dominan
+        # Background berulang = banyak offset berbeda yang sama-sama besar
+        n_dominant_offsets = sum(1 for v in counts.values() if v >= max_consistent * 0.5)
+
+        if n_dominant_offsets > 5:
+            # Background berulang — score rendah
+            score = min(0.3, max_consistent / 100)
+        elif max_consistent >= 15:
+            score = min(1.0, 0.7 + (max_consistent - 15) / 50 * 0.3)
+        elif max_consistent >= 8:
+            score = 0.45 + (max_consistent - 8) / 7 * 0.25
+        elif max_consistent >= 3:
+            score = 0.2 + (max_consistent - 3) / 5 * 0.25
         else:
-            score = min(0.3, max_consistent / 20)
+            score = max_consistent / 3 * 0.2
 
     score = round(score, 3)
 
