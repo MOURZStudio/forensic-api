@@ -233,11 +233,24 @@ def run_metadata(file_bytes, img):
         fields.append({'name': 'Info Flash', 'value': str(flash_val) if has_flash else 'Tidak Ada', 'ok': has_flash})
 
         # --- Hitung skor ---
-        no_exif  = len(exif) < 3
-        if no_exif:
-            suspicious = 4   # Tidak ada EXIF sama sekali = sangat mencurigakan
+        # FIX v2.1: no_exif berbasis ketiadaan field KAMERA, bukan jumlah total.
+        # Foto AI/Kaggle bisa punya 4-5 field EXIF teknis (resolusi, orientasi)
+        # tapi tidak punya Model Kamera dan Timestamp — dua field paling kritis.
+        # Referensi: Astillero (2025) — metadata kamera adalah indikator utama e-KYC.
+        no_camera_model = not has_camera
+        no_timestamp    = not has_datetime
+        no_exif_camera  = no_camera_model and no_timestamp
 
-        score = min(1.0, suspicious * 0.16 + (0.40 if no_exif else 0.0))
+        no_exif = len(exif) < 3
+
+        if no_exif_camera:
+            suspicious = max(suspicious, 3)
+        if no_exif:
+            suspicious = max(suspicious, 4)
+
+        # Bonus jika tidak ada model kamera — indikator terkuat e-KYC
+        camera_bonus = 0.25 if no_camera_model else 0.0
+        score = min(1.0, suspicious * 0.16 + camera_bonus + (0.15 if no_exif else 0.0))
         score = round(score, 4)
 
         return {
@@ -385,7 +398,30 @@ def run_dct(img):
         # Parameter normalisasi 15 (diturunkan dari 25) karena log-transform
         # menghasilkan anomaly_ratio yang lebih moderat.
         # Jika >15% blok anomali setelah log-transform → skor maksimum.
-        score = float(min(1.0, anomaly_ratio / 15.0))
+        # --- Langkah 7: Hitung skor ternormalisasi ---
+        # Normalisasi adaptif: gunakan persentil 95 sebagai acuan bukan nilai tetap.
+        # Foto KTP berlatar polos (merah/biru) menghasilkan anomali_ratio tinggi
+        # secara natural karena kontras ekstrem latar vs objek.
+        # Solusi: normalisasi berdasarkan karakteristik distribusi log itu sendiri.
+        #
+        # Gunakan CV_log (std_log / mu_log) sebagai indikator utama:
+        # - CV_log tinggi (>1.0) + anomaly tinggi = citra natural dengan kontras tinggi
+        # - CV_log rendah (<0.8) + anomaly sedang = pola GAN (distribusi terlalu seragam)
+        # Referensi: Guarnera dkk (2020) — GAN menghasilkan distribusi AC lebih seragam.
+        cv_log = std_log / (mu_log + 1e-6)
+
+        if cv_log > 1.5:
+            # Distribusi sangat tidak merata = foto natural kontras tinggi (KTP, latar polos)
+            # Naikkan denominator agar tidak over-detect
+            norm_factor = 40.0
+        elif cv_log > 0.8:
+            # Distribusi sedang — bisa natural atau manipulasi, gunakan parameter standar
+            norm_factor = 25.0
+        else:
+            # CV_log rendah = distribusi terlalu seragam = fingerprint GAN
+            norm_factor = 15.0
+
+        score = float(min(1.0, anomaly_ratio / norm_factor))
 
         # --- Langkah 8: Buat visualisasi heatmap DCT ---
         # Buat peta energi AC untuk divisualisasikan
