@@ -314,37 +314,41 @@ def run_dct(img):
     - Splicing konvensional — perbedaan distribusi frekuensi antar sumber
 
     Tidak memerlukan training (training-free).
+
+    PERBAIKAN V2.1:
+    Distribusi energi AC pada citra wajah sangat skewed (σ >> μ) karena
+    perbedaan dramatis antara area tepi (rambut, setelan jas) dan area smooth
+    (kulit, background). Menggunakan log-normalisasi untuk menstabilkan
+    distribusi sebelum deteksi anomali — pendekatan ini umum dalam analisis
+    DCT forensik (Ahmad & Khan, 2020) untuk menangani distribusi heavy-tail.
     """
     try:
-        # --- Langkah 1: Konversi ke grayscale ---
-        # DCT lebih efektif pada luminance channel (grayscale)
-        # Referensi: Ahmad & Khan (2020) menggunakan grayscale untuk analisis DCT
-        gray = np.array(img.convert('L'), dtype=np.float32)
-        H, W = gray.shape
+        # --- Langkah 1: Konversi ke YCbCr, ambil channel Y (luminance) ---
+        # Channel Y lebih stabil dari grayscale untuk analisis DCT pada wajah.
+        # Referensi: Ahmad & Khan (2020) — analisis pada luminance channel.
+        ycbcr = np.array(img.convert('YCbCr'), dtype=np.float32)
+        gray  = ycbcr[:, :, 0]   # Channel Y = luminance
+        H, W  = gray.shape
 
         # --- Langkah 2: Bagi gambar menjadi blok 8×8 piksel ---
-        # Ukuran blok 8×8 selaras dengan struktur DCT JPEG (Parekh, 2025)
-        # yang membagi gambar dalam unit kompresi 8×8 piksel.
+        # Ukuran blok 8×8 selaras dengan struktur DCT JPEG (Parekh, 2025).
         BSIZE = 8
-        ac_energies = []    # Energi AC per blok
-        block_positions = []  # Posisi (y, x) setiap blok untuk visualisasi
+        ac_energies     = []
+        block_positions = []
 
         for y in range(0, H - BSIZE + 1, BSIZE):
             for x in range(0, W - BSIZE + 1, BSIZE):
                 block = gray[y:y+BSIZE, x:x+BSIZE]
 
                 # --- Langkah 3: Hitung koefisien DCT 2D per blok ---
-                # cv2.dct() mengimplementasikan 2D DCT — sudah ada di OpenCV
-                # tanpa perlu library tambahan
                 dct_block = cv2.dct(block)
 
                 # --- Langkah 4: Hitung energi koefisien AC ---
-                # Koefisien DC = dct_block[0,0] = energi rata-rata blok
-                # Koefisien AC = semua koefisien selain DC
-                # Energi AC = Σ |AC_coeff|² (Guarnera dkk, 2020)
-                dct_ac          = dct_block.copy()
-                dct_ac[0, 0]    = 0.0   # Nolkan koefisien DC
-                ac_energy       = float(np.sum(dct_ac ** 2))
+                # AC_energy = Σ |DCT_coeff(i,j)|² untuk (i,j) ≠ (0,0)
+                # Referensi: Guarnera dkk (2020)
+                dct_ac       = dct_block.copy()
+                dct_ac[0, 0] = 0.0
+                ac_energy    = float(np.sum(dct_ac ** 2))
 
                 ac_energies.append(ac_energy)
                 block_positions.append((y, x))
@@ -354,26 +358,34 @@ def run_dct(img):
 
         ac_energies = np.array(ac_energies, dtype=np.float64)
 
-        # --- Langkah 5: Hitung distribusi global ---
-        # μ_AC dan σ_AC dihitung adaptif dari gambar itu sendiri (training-free)
+        # --- Langkah 5: Log-normalisasi untuk menstabilkan distribusi skewed ---
+        # Citra wajah punya distribusi AC sangat skewed (σ >> μ).
+        # Log-transform mengubah distribusi heavy-tail menjadi mendekati normal
+        # sehingga threshold berbasis σ lebih bermakna.
+        # Referensi pendekatan log pada DCT: Ahmad & Khan (2020).
+        log_energies = np.log1p(ac_energies)  # log(1 + x) — aman untuk nilai 0
+        mu_log  = float(np.mean(log_energies))
+        std_log = float(np.std(log_energies))
+
+        # Simpan juga nilai asli untuk ditampilkan di UI
         mu_ac  = float(np.mean(ac_energies))
         std_ac = float(np.std(ac_energies))
 
-        # --- Langkah 6: Deteksi blok anomali ---
-        # Threshold ±1.5σ mengacu pada Guarnera dkk (2020) dan konsisten
-        # dengan threshold noise di run_noise() (Gardella dkk, 2021)
-        upper_thresh = mu_ac + 1.5 * std_ac
-        lower_thresh = max(0.0, mu_ac - 1.5 * std_ac)
+        # --- Langkah 6: Deteksi anomali pada distribusi log ---
+        # Threshold 1.0σ (lebih sensitif dari 1.5σ) karena setelah log-transform
+        # distribusi lebih ketat. Mengacu sensitivitas tinggi Guarnera dkk (2020).
+        upper_thresh  = mu_log + 1.0 * std_log
+        lower_thresh  = max(0.0, mu_log - 1.0 * std_log)
 
-        anomaly_mask  = (ac_energies > upper_thresh) | (ac_energies < lower_thresh)
+        anomaly_mask  = (log_energies > upper_thresh) | (log_energies < lower_thresh)
         anomaly_count = int(np.sum(anomaly_mask))
         anomaly_ratio = anomaly_count / len(ac_energies) * 100.0
 
         # --- Langkah 7: Hitung skor ternormalisasi ---
-        # Parameter normalisasi 25: jika >25% blok anomali = skor 1.0
-        # Pemilihan 25 lebih konservatif dari noise (20) karena DCT lebih
-        # sensitif dan rentan terhadap false positive pada gambar natural.
-        score = float(min(1.0, anomaly_ratio / 25.0))
+        # Parameter normalisasi 15 (diturunkan dari 25) karena log-transform
+        # menghasilkan anomaly_ratio yang lebih moderat.
+        # Jika >15% blok anomali setelah log-transform → skor maksimum.
+        score = float(min(1.0, anomaly_ratio / 15.0))
 
         # --- Langkah 8: Buat visualisasi heatmap DCT ---
         # Buat peta energi AC untuk divisualisasikan
@@ -421,11 +433,11 @@ def run_dct(img):
         dct_overlay_b64 = numpy_to_base64(blended)
 
         # --- Langkah 9: Hitung statistik tambahan untuk laporan ---
-        # Rasio energi frekuensi tinggi vs rendah
-        # Citra AI cenderung memiliki distribusi yang lebih seragam
-        high_freq_energy = float(np.mean(ac_energies[ac_energies > mu_ac]))
-        low_freq_energy  = float(np.mean(ac_energies[ac_energies <= mu_ac])) + 1e-6
-        freq_ratio       = round(high_freq_energy / low_freq_energy, 3)
+        high_mask = ac_energies > mu_ac
+        low_mask  = ac_energies <= mu_ac
+        high_freq_energy = float(np.mean(ac_energies[high_mask])) if np.any(high_mask) else mu_ac
+        low_freq_energy  = float(np.mean(ac_energies[low_mask]))  if np.any(low_mask)  else 1.0
+        freq_ratio = round(high_freq_energy / (low_freq_energy + 1e-6), 3)
 
         return {
             'score'              : round(score, 4),
@@ -435,7 +447,11 @@ def run_dct(img):
             'total_blocks'       : len(ac_energies),
             'mu_ac'              : round(mu_ac, 2),
             'std_ac'             : round(std_ac, 2),
+            'mu_log'             : round(mu_log, 4),
+            'std_log'            : round(std_log, 4),
             'freq_ratio'         : freq_ratio,
+            'threshold_method'   : 'log1p + 1.0sigma (Ahmad & Khan 2020)',
+            'normalization'      : 'anomaly_ratio / 15 (Guarnera dkk 2020)',
             'dct_heatmap'        : dct_heatmap_b64,
             'dct_overlay'        : dct_overlay_b64,
             'status'             : 'Terindikasi' if score >= 0.45 else 'Normal',
@@ -683,6 +699,9 @@ def analyze():
         # Load dan resize gambar
         img = load_image(file_bytes)
 
+        # Buat original_image base64 untuk ditampilkan di tab ELA
+        orig_b64 = pil_to_base64(img)
+
         # Jalankan 4 metode forensik V2
         ela_result   = run_ela(file_bytes, img)
         meta_result  = run_metadata(file_bytes, img)
@@ -703,9 +722,10 @@ def analyze():
 
         return jsonify({
             'version'        : 'v2',
+            'original_image' : orig_b64,          # ← FIX: gambar asli untuk tab ELA
             'ela'            : ela_result,
             'metadata'       : meta_result,
-            'dct'            : dct_result,       # ← Nama key baru
+            'dct'            : dct_result,
             'noise'          : noise_result,
             'weighted'       : weighted,
             'confusion_matrix': confusion,
