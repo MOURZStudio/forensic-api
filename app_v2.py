@@ -58,10 +58,10 @@ ELA_QUALITY = 90           # Kualitas rekompresi ELA — Bisri & Marzuki (2023)
 # BOBOT V2 — Diperbarui setelah Clone Detection dihapus
 # Total = 1.0
 WEIGHTS_V2 = {
-    'ela'  : 0.30,   # Error Level Analysis    — Bisri & Marzuki (2023)
-    'cnn'  : 0.30,   # CNN MobileNetV2         — Yilmaz & Cinar (2024)
-    'noise': 0.15,   # Local Noise Variance    — Gardella dkk (2021)
-    'meta' : 0.25,   # Metadata Analysis       — Astillero (2025)
+    'ela'  : 0.30,   # Error Level Analysis    — Bisri & Marzuki (2023); akurasi 94.6-96.6% pada CASIA
+    'cnn'  : 0.25,   # CNN MobileNetV2         — Yilmaz & Cinar (2024); val accuracy 78.6% pada Kaggle 140K
+    'noise': 0.20,   # Local Noise Variance    — Gardella dkk (2021) DOI:10.3390/jimaging7070119
+    'meta' : 0.25,   # Metadata Analysis       — Astillero (2025); akurasi >89% deteksi AI-generated
 }
 
 # Threshold keputusan akhir — konservatif untuk konteks e-KYC perbankan
