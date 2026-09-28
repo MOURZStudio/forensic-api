@@ -5,27 +5,32 @@
 # PERUBAHAN DARI V1:
 #   - Clone Detection (ORB) → DIHAPUS
 #   - CNN MobileNetV2 → DITAMBAHKAN untuk deteksi wajah AI-generated
-#   - Bobot: meta=0.25, ela=0.30, cnn=0.30, noise=0.15
+#   - Bobot final (lihat WEIGHTS_V2 di bawah): ela=0.30, cnn=0.25, noise=0.20, meta=0.25
 #
 # REFERENSI ILMIAH UNTUK run_cnn():
-#   [1] Yilmaz & Cinar (2024)
-#       "Real vs Fake Face Detection using MobileNetV2 Transfer Learning"
-#       PeerJ Computer Science. DOI: 10.7717/peerj-cs.2103
+#   [1] Sandler, M., Howard, A., Zhu, M., Zhmoginov, A., & Chen, L.-C. (2018)
+#       "MobileNetV2: Inverted Residuals and Linear Bottlenecks"
+#       CVPR 2018. DOI: 10.48550/arXiv.1801.04381
+#
+#   [2] Şafak, E., & Barışçı, N. (2024)
+#       "Detection of fake face images using lightweight convolutional neural
+#        networks with stacking ensemble learning method"
+#       PeerJ Computer Science, 10, e2103. DOI: 10.7717/peerj-cs.2103
 #       Dataset: 140K real-and-fake-faces (StyleGAN) — dataset yang sama
-#
-#   [2] Kishimoto & Suresh (2024)
-#       "MobileNetV2 Transfer Learning for Deepfake Detection"
-#       IEEE ICDABI. DOI: 10.1109/ICDABI63787.2024
-#       Akurasi: 95.14% pada dataset wajah
-#
-#   [3] Howard dkk (2018) — MobileNetV2: Inverted Residuals
-#       arXiv:1801.04381
 #
 # REFERENSI UNTUK METODE LAIN:
 #   run_ela()      → Bisri & Marzuki (2023); Chakraborty dkk (2024)
 #   run_metadata() → Astillero (2025); Soni (2025)
 #   run_noise()    → Pan dkk (2012); Gardella dkk (2021)
 #   compute_weighted() → Korus & Huan (2016) — score level fusion
+#
+# CATATAN PENTING (dibaca sebelum sidang/audit kode):
+#   - Nilai precision/recall/f1 pada compute_weighted_v2() dan confusion
+#     matrix pada compute_matrix() adalah ESTIMASI VISUAL untuk kebutuhan
+#     tampilan frontend, BUKAN hasil perhitungan dari confusion matrix
+#     nyata (pengujian dataset berlabel). Nilai akurasi/presisi/recall/F1
+#     resmi untuk laporan penelitian dihitung terpisah secara manual dari
+#     hasil pengujian sistem terhadap dataset uji berlabel (lihat Bab IV).
 # =============================================================================
 
 import io
@@ -59,7 +64,7 @@ ELA_QUALITY = 90           # Kualitas rekompresi ELA — Bisri & Marzuki (2023)
 # Total = 1.0
 WEIGHTS_V2 = {
     'ela'  : 0.30,   # Error Level Analysis    — Bisri & Marzuki (2023); akurasi 94.6-96.6% pada CASIA
-    'cnn'  : 0.25,   # CNN MobileNetV2         — Yilmaz & Cinar (2024); val accuracy 78.6% pada Kaggle 140K
+    'cnn'  : 0.25,   # CNN MobileNetV2         — Sandler dkk (2018); Şafak & Barışçı (2024); val accuracy 78.6% pada Kaggle 140K
     'noise': 0.20,   # Local Noise Variance    — Gardella dkk (2021) DOI:10.3390/jimaging7070119
     'meta' : 0.25,   # Metadata Analysis       — Astillero (2025); akurasi >89% deteksi AI-generated
 }
@@ -70,7 +75,8 @@ THRESHOLD_MANIPULATED = 0.45
 # =============================================================================
 # LOAD MODEL CNN MobileNetV2
 # Dilatih pada dataset Kaggle 140K real-and-fake-faces (StyleGAN)
-# Referensi: Yilmaz & Cinar (2024) DOI:10.7717/peerj-cs.2103
+# Referensi: Sandler dkk (2018) DOI:10.48550/arXiv.1801.04381
+#            Şafak & Barışçı (2024) DOI:10.7717/peerj-cs.2103
 # =============================================================================
 _CNN_MODEL = None
 
@@ -291,51 +297,12 @@ def run_metadata(file_bytes, img):
 # =============================================================================
 # METODE 3: run_cnn() — CNN MobileNetV2 Transfer Learning ← MENGGANTIKAN CLONE
 #
-# REFERENSI UTAMA:
-#   [1] Guarnera, L., Giudice, O., & Battiato, S. (2020).
-#       "Fighting Deepfakes by Detecting GAN DCT Anomalies"
-#       Journal of Imaging, 6(8), 76.
-#       PMC: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8404913/
-#       → Membuktikan citra GAN meninggalkan anomali pada distribusi
-#         koefisien AC DCT di blok 8×8.
-#
-#   [2] Pontorno, O., Guarnera, L., & Battiato, S. (2024).
-#       "On the Exploitation of DCT-Traces in the Generative-AI Domain"
-#       arXiv:2402.02209
-#       → Memperluas [1] ke Diffusion Model. Kode tersedia di GitHub.
-#
-#   [3] Ahmad, I., & Khan, R. U. (2020).
-#       "Detection and localization of forgery using statistics of DCT
-#        and Fourier components"
-#       Signal Processing: Image Communication, 84, 115846.
-#       DOI: https://doi.org/10.1016/j.image.2019.115846
-#       → Doubly stochastic model koefisien DCT per blok untuk deteksi
-#         splicing dan copy-move pada CASIA dataset.
-#
-# PRINSIP KERJA:
-#   Citra asli dari kamera memiliki distribusi energi koefisien AC DCT
-#   yang mengikuti pola Generalized Gaussian yang konsisten antar blok.
-#   Ketika ada manipulasi (splicing, AI generation, face swap), distribusi
-#   ini terganggu — muncul blok dengan energi AC yang menyimpang jauh
-#   dari distribusi global gambar.
-#
-# FORMULA:
-#   Untuk setiap blok 8×8:
-#     AC_energy(b) = Σ |DCT_coeff(i,j)|² untuk (i,j) ≠ (0,0)
-#
-#   Statistik global:
-#     μ_AC = mean(AC_energy semua blok)
-#     σ_AC = std(AC_energy semua blok)
-#
-#   Anomali per blok (mengacu Guarnera dkk, 2020):
-#     anomali = True jika AC_energy(b) > μ_AC + 1.5σ_AC
-#                       ATAU AC_energy(b) < μ_AC - 1.5σ_AC
-#     (threshold 1.5σ dipilih untuk sensitivitas optimal — sama dengan
-#      run_noise() yang juga menggunakan 1.5σ, Gardella dkk 2021)
-#
-#   Skor ternormalisasi:
-#     s_DCT = min(1.0, anomaly_ratio / 25)
-#     (parameter 25 = jika >25% blok anomali → skor maksimum)
+# Jalur utama deteksi manipulasi AI generatif. Detail arsitektur, dataset
+# training, dan referensi ilmiah ada di docstring dalam fungsi run_cnn()
+# di bawah ini. Jika model .h5 gagal dimuat atau TensorFlow tidak
+# tersedia di environment, sistem otomatis beralih ke run_cnn_fallback()
+# (metode DCT-Trace Anomaly Detection, lihat komentar di atas fungsi
+# tersebut).
 # =============================================================================
 def run_cnn(img):
     """
@@ -348,12 +315,11 @@ def run_cnn(img):
     4. Output: probabilitas manipulasi 0.0 - 1.0
 
     REFERENSI:
-    [1] Yilmaz & Cinar (2024) — MobileNetV2 pada dataset 140K StyleGAN
-        DOI: 10.7717/peerj-cs.2103 — Val Accuracy: 78.6%
-    [2] Kishimoto & Suresh (2024) — Transfer Learning deepfake detection
-        DOI: 10.1109/ICDABI63787.2024 — Accuracy: 95.14%
-    [3] Howard dkk (2018) — MobileNetV2 architecture
-        arXiv:1801.04381
+    [1] Sandler dkk (2018) — Arsitektur MobileNetV2
+        DOI: 10.48550/arXiv.1801.04381
+    [2] Şafak & Barışçı (2024) — Deteksi wajah palsu dengan lightweight CNN
+        (termasuk MobileNetV2) + stacking ensemble, pada dataset wajah GAN
+        DOI: 10.7717/peerj-cs.2103
 
     Dataset training: Kaggle 140K Real and Fake Faces (StyleGAN2)
     Training: 10.000 foto | Validasi: 1.000 foto
@@ -401,7 +367,7 @@ def run_cnn(img):
             'architecture': 'MobileNetV2 + GlobalAvgPool + Dense(256) + Dense(64) + Sigmoid',
             'dataset'     : 'Kaggle 140K Real & Fake Faces (StyleGAN2)',
             'val_accuracy': '78.6%',
-            'reference'   : 'Yilmaz & Cinar (2024) DOI:10.7717/peerj-cs.2103',
+            'reference'   : 'Sandler dkk (2018) DOI:10.48550/arXiv.1801.04381; Safak & Bariisci (2024) DOI:10.7717/peerj-cs.2103',
             'cnn_heatmap' : numpy_to_base64(heatmap_color),
             'cnn_overlay' : numpy_to_base64(blended),
             'status'      : 'Terindikasi' if score >= 0.45 else 'Normal',
@@ -417,6 +383,58 @@ def run_cnn(img):
         }
 
 
+# =============================================================================
+# METODE 3 (CADANGAN): run_cnn_fallback() — DCT-Trace Anomaly Detection
+# Dipakai HANYA jika model CNN MobileNetV2 (.h5) gagal dimuat atau
+# TensorFlow tidak tersedia di environment. Tidak dipakai pada kondisi
+# normal (model .h5 sudah terverifikasi berhasil dimuat).
+#
+# REFERENSI UTAMA:
+#   [1] Guarnera, L., Giudice, O., & Battiato, S. (2020).
+#       "Fighting Deepfakes by Detecting GAN DCT Anomalies"
+#       Journal of Imaging, 6(8), 76.
+#       PMC: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8404913/
+#       → Membuktikan citra GAN meninggalkan anomali pada distribusi
+#         koefisien AC DCT di blok 8×8.
+#
+#   [2] Pontorno, O., Guarnera, L., & Battiato, S. (2024).
+#       "On the Exploitation of DCT-Traces in the Generative-AI Domain"
+#       arXiv:2402.02209
+#       → Memperluas [1] ke Diffusion Model. Kode tersedia di GitHub.
+#
+#   [3] Ahmad, I., & Khan, R. U. (2020).
+#       "Detection and localization of forgery using statistics of DCT
+#        and Fourier components"
+#       Signal Processing: Image Communication, 84, 115846.
+#       DOI: https://doi.org/10.1016/j.image.2019.115846
+#       → Doubly stochastic model koefisien DCT per blok untuk deteksi
+#         splicing dan copy-move pada CASIA dataset.
+#
+# PRINSIP KERJA:
+#   Citra asli dari kamera memiliki distribusi energi koefisien AC DCT
+#   yang mengikuti pola Generalized Gaussian yang konsisten antar blok.
+#   Ketika ada manipulasi (splicing, AI generation, face swap), distribusi
+#   ini terganggu — muncul blok dengan energi AC yang menyimpang jauh
+#   dari distribusi global gambar.
+#
+# FORMULA:
+#   Untuk setiap blok 8×8:
+#     AC_energy(b) = Σ |DCT_coeff(i,j)|² untuk (i,j) ≠ (0,0)
+#
+#   Statistik global:
+#     μ_AC = mean(AC_energy semua blok)
+#     σ_AC = std(AC_energy semua blok)
+#
+#   Anomali per blok (mengacu Guarnera dkk, 2020):
+#     anomali = True jika AC_energy(b) > μ_AC + 1.5σ_AC
+#                       ATAU AC_energy(b) < μ_AC - 1.5σ_AC
+#     (threshold 1.5σ dipilih untuk sensitivitas optimal — sama dengan
+#      run_noise() yang juga menggunakan 1.5σ, Gardella dkk 2021)
+#
+#   Skor ternormalisasi:
+#     s_DCT = min(1.0, anomaly_ratio / 25)
+#     (parameter 25 = jika >25% blok anomali → skor maksimum)
+# =============================================================================
 def run_cnn_fallback(img):
     """
     Fallback jika model CNN belum tersedia atau TensorFlow tidak terinstall.
@@ -552,12 +570,19 @@ def compute_weighted_v2(ela, meta, cnn, noise):
 
     Rumus:
         WS = (w_meta × s_meta) + (w_ela × s_ela) +
-             (w_dct  × s_dct)  + (w_noise × s_noise)
+             (w_cnn  × s_cnn)  + (w_noise × s_noise)
 
     Bonus konvergensi: jika ≥2 metode mendeteksi anomali → +10%
     Bonus e-KYC:       jika tidak ada EXIF kamera → +8%
 
     Referensi: Korus & Huan (2016) — score level fusion
+
+    PENTING: precision/recall/f1 pada return value fungsi ini adalah
+    ESTIMASI VISUAL untuk kebutuhan tampilan frontend (dihitung langsung
+    dari nilai WS satu citra), BUKAN hasil precision/recall/F1 statistik
+    yang sesungguhnya (yang memerlukan agregasi TP/TN/FP/FN dari banyak
+    citra berlabel). Nilai resmi untuk laporan penelitian dihitung
+    terpisah secara manual dari pengujian sistem terhadap dataset uji.
     """
     s_ela   = ela.get('score', 0.0)
     s_meta  = meta.get('score', 0.0)
@@ -593,12 +618,15 @@ def compute_weighted_v2(ela, meta, cnn, noise):
     is_manipulated  = ws >= THRESHOLD_MANIPULATED
     risk            = 'Tinggi' if ws >= 0.70 else ('Sedang' if ws >= 0.45 else 'Rendah')
 
-    # Kalkulasi F1 sederhana (estimasi berbasis skor)
-    precision = round(ws, 3)
-    recall    = round(min(1.0, ws * 1.05), 3)
-    f1 = round(
-        2 * precision * recall / (precision + recall + 1e-6), 3
-    ) if (precision + recall) > 0 else 0.0
+    # ESTIMASI precision/recall/f1 untuk tampilan frontend SAJA.
+    # Bukan hasil perhitungan dari confusion matrix nyata (lihat
+    # docstring fungsi ini). Jangan dikutip sebagai hasil evaluasi
+    # ilmiah pada laporan penelitian.
+    precision_estimasi = round(ws, 3)
+    recall_estimasi    = round(min(1.0, ws * 1.05), 3)
+    f1_estimasi = round(
+        2 * precision_estimasi * recall_estimasi / (precision_estimasi + recall_estimasi + 1e-6), 3
+    ) if (precision_estimasi + recall_estimasi) > 0 else 0.0
 
     return {
         'weighted_score'    : ws,
@@ -607,9 +635,10 @@ def compute_weighted_v2(ela, meta, cnn, noise):
         'verdict'           : 'TERINDIKASI MANIPULASI' if is_manipulated else 'CITRA TAMPAK ASLI',
         'risk_level'        : risk,
         'methods_positive'  : methods_positive,
-        'precision'         : precision,
-        'recall'            : recall,
-        'f1'                : f1,
+        'precision'         : precision_estimasi,   # ESTIMASI, bukan hasil evaluasi statistik nyata
+        'recall'            : recall_estimasi,       # ESTIMASI, bukan hasil evaluasi statistik nyata
+        'f1'                : f1_estimasi,           # ESTIMASI, bukan hasil evaluasi statistik nyata
+        'is_estimated_metric': True,
         'weights_used'      : w,
         'scores_detail'     : {
             'ela'  : round(s_ela   * 100, 1),
@@ -626,8 +655,14 @@ def compute_weighted_v2(ela, meta, cnn, noise):
 # =============================================================================
 def compute_matrix(score):
     """
-    Estimasi confusion matrix berdasarkan skor tunggal.
-    Digunakan untuk perbandingan antar metode di tab Perbandingan.
+    ESTIMASI confusion matrix berdasarkan SATU skor tunggal (bukan hasil
+    agregasi TP/TN/FP/FN dari pengujian banyak citra berlabel).
+    Hanya untuk kebutuhan visualisasi tab "Perbandingan" di frontend.
+
+    PENTING: TP/TN/FP/FN, akurasi, presisi, recall, dan F1 di sini BUKAN
+    hasil evaluasi ilmiah. Nilai resmi untuk laporan penelitian harus
+    dihitung manual dari confusion matrix nyata (prediksi sistem vs
+    label asli, diagregasi dari seluruh dataset uji berlabel).
     """
     s = float(score)
     if s >= 0.45:
@@ -655,6 +690,7 @@ def compute_matrix(score):
         'precision': precision,
         'recall'   : recall,
         'f1'       : f1_val,
+        'is_estimated_metric': True,
     }
 
 
@@ -746,10 +782,11 @@ def index():
         'changes'    : 'Clone Detection (ORB) digantikan CNN MobileNetV2 Transfer Learning',
         'methods'    : {
             'ELA'   : {'weight': '30%', 'ref': 'Bisri & Marzuki (2023)'},
-            'CNN'   : {'weight': '30%', 'ref': 'Yilmaz & Cinar (2024) DOI:10.7717/peerj-cs.2103'},
-            'Noise' : {'weight': '15%', 'ref': 'Gardella dkk (2021) DOI:10.3390/jimaging7070119'},
+            'CNN'   : {'weight': '25%', 'ref': 'Sandler dkk (2018); Safak & Bariisci (2024) DOI:10.7717/peerj-cs.2103'},
+            'Noise' : {'weight': '20%', 'ref': 'Gardella dkk (2021) DOI:10.3390/jimaging7070119'},
             'Meta'  : {'weight': '25%', 'ref': 'Astillero (2025)'},
         },
+        'note'       : 'precision/recall/f1 pada endpoint /analyze adalah estimasi visual, bukan hasil evaluasi ilmiah terhadap dataset berlabel',
         'endpoint'   : 'POST /analyze — upload gambar dengan field "image"',
     })
 
