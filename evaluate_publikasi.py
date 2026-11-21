@@ -6,12 +6,12 @@ sehingga skor per citra identik dengan yang tampil di web.
 
 Struktur folder (nama folder diawali nomor kelompok Tabel 2):
     data_uji/
-      1_asli_kamera/        -> asli
-      2_asli_whatsapp/      -> asli
-      3_manipulasi_edit/    -> manipulasi
-      4_asli_kaggle/        -> asli
-      5_manipulasi_kaggle/  -> manipulasi
-      6_manipulasi_ai/      -> manipulasi
+      1_asli_kamera/          -> asli
+      2_asli_whatsapp/        -> asli
+      3_manipulasi_edit/      -> manipulasi (editing + metadata diubah)
+      4_manipulasi_faceswap/  -> manipulasi
+      5_benchmark_kaggle/     -> manipulasi (StyleGAN, pembanding)
+Kelompok 1-4 = evaluasi utama (data primer); kelompok 5 = benchmark.
 
 Pemakaian:
     python evaluate_publikasi.py data_uji hasil/
@@ -23,14 +23,14 @@ import sys
 
 from app_publikasi import analyze_bytes, W_M, W_C, T, VERSION
 
-POSITIVE_GROUPS = {3, 5, 6}  # kelas positif = manipulasi
+POSITIVE_GROUPS = {3, 4, 5}  # kelas positif = manipulasi
+PRIMARY_GROUPS = {1, 2, 3, 4}
 GROUP_NAMES = {
-    1: 'Citra asli (kamera ponsel)',
-    2: 'Citra asli via WhatsApp',
-    3: 'Manipulasi editing software & metadata',
-    4: 'Citra asli (Kaggle)',
-    5: 'Citra manipulasi (Kaggle)',
-    6: 'Manipulasi AI (faceswap & generate)',
+    1: 'Asli kamera ponsel',
+    2: 'Asli via WhatsApp',
+    3: 'Edit + metadata diubah',
+    4: 'Face swap',
+    5: 'Benchmark Kaggle (StyleGAN)',
 }
 EXT = ('.jpg', '.jpeg', '.png', '.webp', '.heic', '.bmp', '.tif', '.tiff')
 SCEN = [('metadata_tunggal', 'Metadata tunggal'),
@@ -102,18 +102,30 @@ def main(src, out):
         'cnn_tunggal': [r['pred_cnn'] == 'Manipulasi' for r in rows],
         'gabungan': [r['pred_gabungan'] == 'Manipulasi' for r in rows],
     }
+    subsets = [('Data primer (kelompok 1-4)', [i for i, r in enumerate(rows) if r['kelompok'] in PRIMARY_GROUPS]),
+               ('Semua termasuk benchmark (kelompok 1-5)', list(range(len(rows))))]
 
     L = [f'# Ringkasan uji — {VERSION}',
          f'Bobot W_m = {W_M}, W_c = {W_C}, ambang T = {T} (S > T = manipulasi). '
-         f'Jumlah citra: {len(rows)}.', '',
-         '## Kinerja per skenario', '',
-         '| Skenario | TP | TN | FP | FN | Akurasi | Presisi | Recall | F1-score |',
-         '|---|---|---|---|---|---|---|---|---|']
-    for key, name in SCEN:
-        k = metrics(y, preds[key])
-        L.append(f"| {name} | {k['TP']} | {k['TN']} | {k['FP']} | {k['FN']} | "
-                 f"{k['akurasi']*100:.2f}% | {k['presisi']*100:.2f}% | "
-                 f"{k['recall']*100:.2f}% | {k['f1']*100:.2f}% |")
+         f'Jumlah citra: {len(rows)}.']
+    for title, idx in subsets:
+        if not idx:
+            continue
+        ys = [y[i] for i in idx]
+        L += ['', f'## Kinerja per skenario — {title}, n = {len(idx)}', '',
+              '| Skenario | TP | TN | FP | FN | Akurasi | Presisi | Recall | F1-score |',
+              '|---|---|---|---|---|---|---|---|---|']
+        for key, name in SCEN:
+            k = metrics(ys, [preds[key][i] for i in idx])
+            L.append(f"| {name} | {k['TP']} | {k['TN']} | {k['FP']} | {k['FN']} | "
+                     f"{k['akurasi']*100:.2f}% | {k['presisi']*100:.2f}% | "
+                     f"{k['recall']*100:.2f}% | {k['f1']*100:.2f}% |")
+        L += ['', f'Uji McNemar — {title}', '',
+              '| Perbandingan | Hanya gabungan benar | Hanya tunggal benar | p-value |',
+              '|---|---|---|---|']
+        for key, name in SCEN[:2]:
+            b, c, p = mcnemar(ys, [preds['gabungan'][i] for i in idx], [preds[key][i] for i in idx])
+            L.append(f'| Gabungan vs {name} | {b} | {c} | {p:.4f} |')
 
     L += ['', '## Akurasi per kelompok citra', '',
           '| No | Kelompok | n | Metadata | CNN | Gabungan |', '|---|---|---|---|---|---|']
@@ -124,13 +136,6 @@ def main(src, out):
             ok = sum(preds[key][i] == y[i] for i in idx)
             cells.append(f'{ok}/{len(idx)} ({ok/len(idx)*100:.1f}%)')
         L.append(f"| {g} | {GROUP_NAMES.get(g, '')} | {len(idx)} | " + ' | '.join(cells) + ' |')
-
-    L += ['', '## Uji McNemar (gabungan vs tunggal)', '',
-          '| Perbandingan | Hanya gabungan benar | Hanya tunggal benar | p-value |',
-          '|---|---|---|---|']
-    for key, name in SCEN[:2]:
-        b, c, p = mcnemar(y, preds['gabungan'], preds[key])
-        L.append(f'| Gabungan vs {name} | {b} | {c} | {p:.4f} |')
 
     with open(os.path.join(out, 'ringkasan.md'), 'w') as f:
         f.write('\n'.join(L) + '\n')
