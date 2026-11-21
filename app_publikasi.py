@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     LITERT_AVAILABLE = False
 
-VERSION = 'publikasi-1.2'
+VERSION = 'publikasi-1.3'
 
 # -----------------------------------------------------------------------------
 # Parameter (bagian 2.2, 2.3 dan 2.7 naskah)
@@ -43,9 +43,32 @@ W_M = 0.40                 # bobot metadata
 W_C = 0.60                 # bobot CNN
 T = 0.50                   # ambang keputusan
 
+# Indikator 2 (tag software):
+#   - kode firmware / versi perangkat (mis. 'S901EXXU2AVF1', '26.3.1')  -> normal
+#   - penanda aplikasi kamera bawaan (mis. 'HDR+ 1.0', 'MediaTek Camera') -> normal
+#   - nama software / aplikasi (mis. 'Adobe Photoshop', 'Polarr Photo Editor') -> mencurigakan
 EDITING_SOFTWARE = ['adobe', 'photoshop', 'lightroom', 'gimp', 'canva', 'picsart',
                     'snapseed', 'facetune', 'faceapp', 'meitu', 'pixnova', 'remini',
-                    'stable', 'midjourney', 'dall', 'firefly']
+                    'polarr', 'vsco', 'pixlr', 'fotor', 'beautyplus', 'youcam',
+                    'stable', 'midjourney', 'dall', 'firefly', 'editor', 'edit']
+CAMERA_FIRMWARE_HINTS = ['camera', 'hdr+', 'android', 'ios', 'miui', 'hyperos',
+                         'oneui', 'one ui', 'harmonyos', 'coloros', 'funtouch']
+
+
+def classify_software(value):
+    """Kembalikan (mencurigakan: bool, kategori: str) untuk nilai tag Software."""
+    v = (value or '').strip()
+    if not v:
+        return False, 'Tidak ada tag software'
+    low = v.lower()
+    if any(k in low for k in EDITING_SOFTWARE):
+        return True, 'Nama software editing'
+    if any(k in low for k in CAMERA_FIRMWARE_HINTS):
+        return False, 'Aplikasi kamera bawaan'
+    tokens = v.replace('(', ' ').replace(')', ' ').split()
+    if tokens and all(any(ch.isdigit() for ch in t) for t in tokens):
+        return False, 'Kode firmware/versi perangkat'
+    return True, 'Nama software/aplikasi'
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, 'cnn_mobilenetv2_forensik.tflite')
@@ -180,7 +203,7 @@ def run_metadata(file_bytes):
     has_camera = bool(camera_model)
 
     software = exif.get('Software', '').strip()
-    edit_sw = bool(software) and any(k in software.lower() for k in EDITING_SOFTWARE)
+    edit_sw, sw_kind = classify_software(software)
 
     timestamp = exif.get('DateTimeOriginal') or exif.get('DateTime') or ''
     has_timestamp = bool(timestamp)
@@ -207,7 +230,7 @@ def run_metadata(file_bytes):
          'value': (f'{camera_make} {camera_model}'.strip() or 'Tidak ditemukan'),
          'suspicious': not has_camera, 'role': 'Menambah nilai c'},
         {'no': 2, 'name': 'Tag software',
-         'value': software or 'Tidak ada',
+         'value': (f'{software} ({sw_kind})' if software else 'Tidak ada'),
          'suspicious': edit_sw, 'role': 'Menambah nilai c'},
         {'no': 3, 'name': 'Timestamp',
          'value': timestamp or 'Tidak ditemukan',
