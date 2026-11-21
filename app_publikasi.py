@@ -19,6 +19,7 @@ import threading
 import traceback
 
 import base64
+import re
 
 import cv2
 import numpy as np
@@ -32,7 +33,7 @@ try:
 except ImportError:  # pragma: no cover
     LITERT_AVAILABLE = False
 
-VERSION = 'publikasi-1.3'
+VERSION = 'publikasi-1.4'
 
 # -----------------------------------------------------------------------------
 # Parameter (bagian 2.2, 2.3 dan 2.7 naskah)
@@ -53,6 +54,45 @@ EDITING_SOFTWARE = ['adobe', 'photoshop', 'lightroom', 'gimp', 'canva', 'picsart
                     'stable', 'midjourney', 'dall', 'firefly', 'editor', 'edit']
 CAMERA_FIRMWARE_HINTS = ['camera', 'hdr+', 'android', 'ios', 'miui', 'hyperos',
                          'oneui', 'one ui', 'harmonyos', 'coloros', 'funtouch']
+
+
+# Indikator 1: pola nama model per merek. Model yang tidak sesuai pola merek
+# (mis. 'iPhone I', merek Apple dengan kode Samsung) dianggap TIDAK VALID dan
+# diperlakukan sama dengan model kamera tidak ditemukan.
+MODEL_PATTERNS = {
+    'apple':   r'^(iphone|ipad)\s*(\d{1,2}|se|x|xr|xs)\b',
+    'samsung': r'^(sm-|gt-|sch-|sgh-|shv-|galaxy\s)[a-z0-9]',
+    'google':  r'^pixel\s*(\d|fold|tablet)',
+    'xiaomi':  r'^((redmi|poco|mi|xiaomi)\b|m?\d{4,}[a-z0-9]*$|[a-z]?\d{3,}[a-z0-9]+$)',
+    'redmi':   r'^((redmi|poco)\b|m?\d{4,}[a-z0-9]*$)',
+    'poco':    r'^((poco)\b|m?\d{4,}[a-z0-9]*$)',
+    'oppo':    r'^(cph\d{4}|pa[a-z]m\d{2}|oppo\s|reno|find)',
+    'realme':  r'^(rmx\d{4}|realme\s)',
+    'vivo':    r'^(v\d{4}|vivo\s|i\d{4}|x\d{2,})',
+    'huawei':  r'^([a-z]{3}-[a-z]{1,2}\d{2}|huawei\s|p\d{2}|mate|nova)',
+    'honor':   r'^([a-z]{3}-[a-z]{1,2}\d{2}|honor\s)',
+    'oneplus': r'^(oneplus|[a-z]{2}\d{4}|cph\d{4})',
+    'infinix': r'^(infinix\s|x\d{3,})',
+    'tecno':   r'^(tecno\s|[a-z]{2}\d{1,2}[a-z]?$)',
+}
+
+
+def validate_camera(make, model):
+    """Kembalikan (valid: bool, keterangan: str) untuk pasangan merek-model."""
+    if not model:
+        return False, 'Tidak ditemukan'
+    mk = (make or '').strip().lower()
+    md = model.strip().lower()
+    for brand, pat in MODEL_PATTERNS.items():
+        if brand in mk:
+            md2 = md[len(brand):].strip() if md.startswith(brand) else md
+            if re.search(pat, md2) or re.search(pat, md):
+                return True, 'Sesuai pola perangkat'
+            return False, 'Tidak sesuai pola model ' + brand.capitalize()
+    # merek lain / tidak dikenal: model wajar bila memuat huruf dan angka
+    if re.search(r'[a-z]', md) and re.search(r'\d', md) and len(md) >= 3:
+        return True, 'Merek di luar daftar pola'
+    return False, 'Format model tidak wajar'
 
 
 def classify_software(value):
@@ -192,7 +232,7 @@ def run_metadata(file_bytes):
         editing, timestamp tidak ada) -> 0..3.
         Jika model kamera DAN timestamp tidak ada -> c minimal 3.
         Jika EXIF praktis kosong (< 3 tag terbaca)  -> c = 4.
-    a : 1 jika model kamera tidak ditemukan, selain itu 0.
+    a : 1 jika model kamera tidak ditemukan atau tidak valid, selain itu 0.
     b : 1 jika tag EXIF yang terbaca < 3, selain itu 0.
     GPS, resolusi dan flash = informasi tambahan (tidak menambah c).
     """
@@ -200,7 +240,8 @@ def run_metadata(file_bytes):
 
     camera_make = exif.get('Make', '').strip()
     camera_model = exif.get('Model', '').strip()
-    has_camera = bool(camera_model)
+    camera_valid, camera_note = validate_camera(camera_make, camera_model)
+    has_camera = camera_valid   # model tidak valid diperlakukan sama dengan tidak ditemukan
 
     software = exif.get('Software', '').strip()
     edit_sw, sw_kind = classify_software(software)
@@ -227,7 +268,8 @@ def run_metadata(file_bytes):
 
     indicators = [
         {'no': 1, 'name': 'Merek dan model kamera',
-         'value': (f'{camera_make} {camera_model}'.strip() or 'Tidak ditemukan'),
+         'value': ((f'{camera_make} {camera_model}'.strip() + f' ({camera_note})')
+                   if camera_model else 'Tidak ditemukan'),
          'suspicious': not has_camera, 'role': 'Menambah nilai c'},
         {'no': 2, 'name': 'Tag software',
          'value': (f'{software} ({sw_kind})' if software else 'Tidak ada'),
