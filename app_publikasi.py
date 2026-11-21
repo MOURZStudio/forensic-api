@@ -18,8 +18,11 @@ import os
 import threading
 import traceback
 
+import base64
+
+import cv2
 import numpy as np
-from PIL import Image, ExifTags
+from PIL import Image, ImageOps, ExifTags
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -29,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     LITERT_AVAILABLE = False
 
-VERSION = 'publikasi-1.0'
+VERSION = 'publikasi-1.2'
 
 # -----------------------------------------------------------------------------
 # Parameter (bagian 2.2, 2.3 dan 2.7 naskah)
@@ -44,8 +47,15 @@ EDITING_SOFTWARE = ['adobe', 'photoshop', 'lightroom', 'gimp', 'canva', 'picsart
                     'snapseed', 'facetune', 'faceapp', 'meitu', 'pixnova', 'remini',
                     'stable', 'midjourney', 'dall', 'firefly']
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          'cnn_mobilenetv2_forensik.tflite')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, 'cnn_mobilenetv2_forensik.tflite')
+FACE_MODEL_PATH = os.path.join(BASE_DIR, 'face_detection_yunet_2023mar.onnx')
+
+# Deteksi & crop wajah untuk jalur CNN — menyamakan masukan dengan data latih
+# (FFHQ/StyleGAN: wajah terpotong rapat di tengah bingkai).
+FACE_DETECT_MAX = 1280     # sisi terpanjang citra saat deteksi wajah
+FACE_SCORE_MIN = 0.60      # ambang keyakinan detektor YuNet
+FACE_MARGIN = 2.0          # sisi crop persegi = 2,0 x sisi terpanjang kotak wajah
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -76,11 +86,61 @@ def get_interpreter():
 # -----------------------------------------------------------------------------
 # Praproses (2.2)
 # -----------------------------------------------------------------------------
+def load_oriented(file_bytes):
+    """Buka citra, koreksi orientasi sesuai tag EXIF Orientation, konversi ke RGB."""
+    img = Image.open(io.BytesIO(file_bytes))
+    img = ImageOps.exif_transpose(img)
+    return img.convert('RGB')
+
+
 def load_image(file_bytes):
     """Konversi ke RGB lalu perkecil hingga maks 600 x 600 (rasio dipertahankan)."""
-    img = Image.open(io.BytesIO(file_bytes)).convert('RGB')
+    img = load_oriented(file_bytes)
     img.thumbnail(MAX_SIZE, Image.LANCZOS)
     return img
+
+
+_face_det = None
+
+
+def detect_face_crop(img):
+    """
+    Deteksi wajah (YuNet, OpenCV) dan kembalikan crop persegi di sekitar wajah
+    dengan sisi = FACE_MARGIN x sisi terpanjang kotak wajah.
+    Jika tidak ada wajah terdeteksi, kembalikan (None, info).
+    """
+    global _face_det
+    W, H = img.size
+    scale = min(1.0, FACE_DETECT_MAX / max(W, H))
+    small = img.resize((max(1, round(W * scale)), max(1, round(H * scale))), Image.BILINEAR) \
+        if scale < 1.0 else img
+    bgr = cv2.cvtColor(np.asarray(small), cv2.COLOR_RGB2BGR)
+    if _face_det is None:
+        _face_det = cv2.FaceDetectorYN.create(FACE_MODEL_PATH, '', (320, 320), FACE_SCORE_MIN)
+    _face_det.setInputSize((bgr.shape[1], bgr.shape[0]))
+    _, faces = _face_det.detect(bgr)
+    if faces is None or len(faces) == 0:
+        return None, {'detected': False, 'count': 0}
+
+    # pilih wajah dengan luas kotak terbesar
+    best = max(faces, key=lambda f: f[2] * f[3])
+    x, y, w, h = [float(v) / scale for v in best[:4]]
+    conf = float(best[14])
+    cx, cy = x + w / 2, y + h / 2
+    side = max(w, h) * FACE_MARGIN
+    side = min(side, W, H)
+    left = int(round(min(max(cx - side / 2, 0), W - side)))
+    top = int(round(min(max(cy - side / 2, 0), H - side)))
+    side = int(round(side))
+    crop = img.crop((left, top, left + side, top + side))
+    return crop, {
+        'detected': True,
+        'count': int(len(faces)),
+        'confidence': round(conf, 4),
+        'box': [int(round(x)), int(round(y)), int(round(w)), int(round(h))],
+        'crop': [left, top, side, side],
+        'face_ratio_pct': round(100.0 * w * h / (W * H), 2),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -177,24 +237,41 @@ def run_metadata(file_bytes):
 # -----------------------------------------------------------------------------
 # Jalur 2 — CNN MobileNetV2 (2.4)
 # -----------------------------------------------------------------------------
-def run_cnn(img):
-    """x' = citra RGB 224 x 224 / 255  ->  S_c = sigmoid(...)"""
+def run_cnn(img_full, img_fallback):
+    """
+    Jalur CNN: deteksi & crop wajah -> 224 x 224 -> x/255 -> S_c = sigmoid(...)
+    img_full     : citra RGB orientasi benar, resolusi asli (untuk deteksi & crop)
+    img_fallback : citra hasil praproses 600 x 600 (dipakai bila wajah tidak terdeteksi)
+    """
     it = get_interpreter()
     if it is None:
         raise RuntimeError(f'Model CNN tidak dapat dimuat: {_model_error}')
-    x = np.asarray(img.resize(CNN_SIZE, Image.BICUBIC).convert('RGB'),
-                   dtype=np.float32) / 255.0
+    crop, face = detect_face_crop(img_full)
+    src = crop if crop is not None else img_fallback
+    cnn_in = src.resize(CNN_SIZE, Image.BICUBIC).convert('RGB')
+    buf = io.BytesIO()
+    cnn_in.save(buf, format='JPEG', quality=90)
+    x = np.asarray(cnn_in, dtype=np.float32) / 255.0
     x = np.expand_dims(x, 0)
     with _interp_lock:
         inp = it.get_input_details()[0]['index']
         out = it.get_output_details()[0]['index']
         it.set_tensor(inp, x)
         it.invoke()
-        s_c = float(it.get_tensor(out)[0][0])
+        p_real = float(it.get_tensor(out)[0][0])
+    # Model dilatih dengan folder Kaggle 'fake/' dan 'real/'; Keras mengurutkan kelas
+    # secara alfabetis (fake = 0, real = 1), sehingga neuron sigmoid memberi peluang
+    # citra ASLI. Skor manipulasi S_c = 1 - p_real. (Diverifikasi pada contoh FFHQ
+    # asli vs StyleGAN: keluaran mentah rata-rata 0,89 untuk asli, 0,49-0,71 untuk palsu.)
+    s_c = 1.0 - p_real
     return {
         'score': s_c,
         'score_pct': round(s_c * 100, 2),
         'model': 'MobileNetV2 (ImageNet, beku) + GAP + Dense256/Drop0,5 + Dense64/Drop0,3 + Sigmoid',
+        'raw_sigmoid_p_real': p_real,
+        'face': face,
+        'input': 'crop wajah' if crop is not None else 'citra utuh (wajah tidak terdeteksi)',
+        'cnn_input_image': base64.b64encode(buf.getvalue()).decode('ascii'),
         'decision': 'Manipulasi' if s_c > T else 'Asli',
     }
 
@@ -216,8 +293,10 @@ def weighted(s_m, s_c):
 def analyze_bytes(file_bytes):
     """Satu pipeline untuk web dan uji batch."""
     meta = run_metadata(file_bytes)
-    img = load_image(file_bytes)
-    cnn = run_cnn(img)
+    img_full = load_oriented(file_bytes)
+    img = img_full.copy()
+    img.thumbnail(MAX_SIZE, Image.LANCZOS)
+    cnn = run_cnn(img_full, img)
     final = weighted(meta['score'], cnn['score'])
     return {
         'version': VERSION,
@@ -260,6 +339,7 @@ def health():
         'cnn_loaded': loaded,
         'cnn_error': _model_error,
         'methods': ['MetadataEXIF', 'CNN-MobileNetV2'],
+        'cnn_preprocess': 'koreksi orientasi EXIF + deteksi & crop wajah (YuNet) + 224x224 / 255',
         'weights': {'metadata': W_M, 'cnn': W_C},
         'threshold': T,
     }), (200 if loaded else 503)
