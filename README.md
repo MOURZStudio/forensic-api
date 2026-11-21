@@ -28,3 +28,25 @@ Cek status API.
 - Flask + Gunicorn
 - Pillow (PIL)
 - NumPy
+
+---
+
+## Versi Publikasi (`app_publikasi.py`)
+
+Terpisah dari versi tesis (`app_v2.py` tidak diubah). Hanya 2 metode sesuai naskah publikasi:
+
+- **S_m** — analisis metadata EXIF: `min(1; 0,16c + 0,25a + 0,15b)`
+- **S_c** — CNN MobileNetV2 (model `.tflite`, konversi float32 dari `.h5`, lihat `convert_tflite.py`)
+- **S = 0,40 S_m + 0,60 S_c**, keputusan **S > 0,50 → manipulasi**
+
+Deploy Render (service terpisah):
+
+- Build Command: `pip install -r requirements_publikasi.txt`
+- Start Command: `gunicorn app_publikasi:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1`
+- Environment: `PYTHON_VERSION=3.11.9`
+
+Uji batch data uji (kode yang sama dengan API):
+
+```
+python evaluate_publikasi.py data_uji/ hasil/
+```
